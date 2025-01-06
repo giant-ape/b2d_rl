@@ -25,6 +25,8 @@ from mmcv.datasets.pipelines import Compose
 from mmcv.parallel.collate import collate as  mm_collate_to_batch_form
 from mmcv.core.bbox import get_box_type
 from pyquaternion import Quaternion
+from Bench2DriveZoo.team_code.replay_buffer import LazyPrioritizedMultiStepMemory
+from torch.utils.tensorboard import SummaryWriter
 
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
@@ -33,7 +35,11 @@ IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
 def get_entry_point():
     return 'VadAgent'
 
-
+def update_params(optim, loss, retain_graph=False):
+    optim.zero_grad()
+    loss.backward(retain_graph=retain_graph)
+    optim.step()
+    
 class VadAgent(autonomous_agent.AutonomousAgent):
     def setup(self, path_to_conf_file):
         self.track = autonomous_agent.Track.SENSORS
@@ -67,9 +73,15 @@ class VadAgent(autonomous_agent.AutonomousAgent):
                     plg_lib = importlib.import_module(_module_path)  
   
         self.model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'), test_cfg=cfg.get('test_cfg'))
+
         checkpoint = load_checkpoint(self.model, self.ckpt_path, map_location='cpu', strict=True)
+        
         self.model.cuda()
         self.model.eval()
+        
+        # self.init_rl_parameter(cfg)
+        # self.init_rl_model()
+        
         self.inference_only_pipeline = []
         for inference_only_pipeline in cfg.inference_only_pipeline:
             if inference_only_pipeline["type"] not in ['LoadMultiViewImageFromFilesInCeph','LoadMultiViewImageFromFiles']:
@@ -170,6 +182,289 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         topdown_intrinsics = np.array([[548.993771650447, 0.0, 256.0, 0], [0.0, 548.993771650447, 256.0, 0], [0.0, 0.0, 1.0, 0], [0, 0, 0, 1.0]])
         self.coor2topdown = topdown_intrinsics @ self.coor2topdown
 
+    def init_rl_parameter(self,cfg):
+
+        self.qf1_optimizer = None
+        self.qf2_optimizer = None
+        self.vf_optimizer = None
+        self.policy_optimizer = None
+        self.alpha_optimizer = None
+        self.alpha = None
+        self.memory_size = cfg.memory_size
+        self.plan_anchors = np.load(cfg.plan_anchors_path, allow_pickle=True)
+        self.device = torch.device("cuda")
+        
+        self.tau = cfg.tau
+        self.alpha = cfg.alpha
+        self.auto_alpha = cfg.auto_alpha
+        self.target_update_interval = cfg.target_update_interval
+        self.learning_steps = 0
+        self.log_interval = 0
+        
+        if cfg.auto_alpha:
+            self.log_alpha = torch.tensor(np.log(cfg.alpha), requires_grad=True, device=self.device)
+            self.alpha = self.log_alpha.exp()
+            self.target_alpha = -np.log(1.0 / cfg.action_size) * cfg.target_entropy_ratio
+            self.alpha_optimizer = AdamW([self.log_alpha], lr=lr)
+
+        if use_per:
+            beta_steps = (cfg.num_steps - cfg.start_steps) / cfg.update_interval
+            self.memory = LazyPrioritizedMultiStepMemory(
+                capacity=cfg.memory_size,
+                state_shape = cfg.state_shape,
+                device=self.device, 
+                gamma=cfg.gamma, 
+                multi_step=cfg.multi_step,
+                beta_steps=cfg.beta_steps)
+        else:
+            self.memory = LazyMultiStepMemory(
+                capacity=cfg.memory_size,
+                state_shape = cfg.state_shape,
+                device=self.device, 
+                gamma=cfg.gamma, 
+                multi_step=cfg.multi_step)
+            
+        self.log_dir = cfg.log_dir
+        self.model_dir = os.path.join(cfg.log_dir, 'model')
+
+        current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        timestamp_dir = 'summary_' + current_time
+        self.summary_dir = os.path.join(cfg.log_dir, 'summary', timestamp_dir)
+        if not os.path.exists(self.model_dir):
+            os.makedirs(self.model_dir)
+        if not os.path.exists(self.summary_dir):
+            os.makedirs(self.summary_dir)
+        self.writer = SummaryWriter(log_dir=self.summary_dir)
+        
+    def init_rl_model(self):
+        self.qf1 = build_model(cfg.model2,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
+        self.qf2 = build_model(cfg.model2,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
+        self.vf = build_model(cfg.model2,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
+        self.vf_target = build_model(cfg.model2,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
+        self.policy = build_model(cfg.model3,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
+        
+        self.qf1.init_weights()
+        self.qf2.init_weights()
+        self.vf.init_weights()
+        self.vf_target.init_weights()
+        self.policy.init_weights()
+        
+        state_dict_w = self.model.state_dict()
+        state_dict_qf1 = self.qf1.state_dict()
+        state_dict_qf2 = self.qf2.state_dict()
+        state_dict_vf = self.vf.state_dict()
+        state_dict_vf_target = self.vf_target.state_dict()
+        state_dict_policy = self.policy.state_dict()
+        
+        for name, param in state_dict_w.items():
+            if name in state_dict_qf1:
+                state_dict_qf1[name].copy_(param)
+            if name in state_dict_qf2:
+                state_dict_qf2[name].copy_(param)
+            if name in state_dict_vf:
+                state_dict_vf[name].copy_(param)
+            if name in state_dict_vf_target:
+                state_dict_vf_target[name].copy_(param)
+            if name in state_dict_policy:
+                state_dict_policy[name].copy_(param)
+                    
+        self.qf1.load_state_dict(state_dict_qf1)
+        self.qf2.load_state_dict(state_dict_qf2)
+        self.vf.load_state_dict(state_dict_vf)
+        self.vf_target.load_state_dict(state_dict_vf_target)
+        self.policy.load_state_dict(state_dict_policy)
+        
+        for name, param in self.qf1.named_parameters():
+            if name in state_dict_w:
+                param.requires_grad = False
+        for name, param in self.qf2.named_parameters():
+            if name in state_dict_w:
+                param.requires_grad = False
+        for name, param in self.vf.named_parameters():
+            if name in state_dict_w:
+                param.requires_grad = False
+        for name, param in self.policy.named_parameters():
+            if name in state_dict_w:
+                param.requires_grad = False
+                
+        self.vf_target.load_state_dict(self.vf.state_dict())
+        
+        self.qf1_optimizer = AdamW(self.qf1.parameters(), lr=lr)
+        self.qf2_optimizer = AdamW(self.qf2.parameters(), lr=lr)
+        self.vf_optimizer = AdamW(self.vf.parameters(), lr=lr)
+        self.policy_optimizer = AdamW(self.policy.parameters(), lr=lr)
+        
+        self.qf1.cuda()
+        self.qf2.cuda()
+        self.vf.cuda()
+        self.vf_target.cuda()
+        self.policy.cuda()
+        
+        self.qf1.eval()
+        self.qf2.eval()
+        self.vf.eval()
+        self.vf_target.eval()
+        self.policy.eval()
+        
+    def calc_current_q(self, states, actions, rewards, next_states, dones):
+        curr_q1 = self.qf1(states, actions)
+        curr_q2 = self.qf2(states, actions)
+
+        return curr_q1, curr_q2
+
+    def calc_target_q(self, states, actions, rewards, next_states, dones):
+        with torch.no_grad():
+            next_values = self.vf_target(next_states)
+            target_q = rewards + (1 - dones) * self.alpha * next_values
+        return target_q
+    
+    def calc_critic_loss(self, batch, weights):
+        curr_q1, curr_q2 = self.calc_current_q(*batch)
+        target_q = self.calc_target_q(*batch)
+
+        target_q_obs = target_q.detach().mean().item()
+
+        errors = torch.abs(curr_q1.detach() - target_q)
+        mean_q1 = curr_q1.detach().mean().item()
+        mean_q2 = curr_q2.detach().mean().item()
+        
+        q1_loss = torch.mean((curr_q1 - target_q).pow(2) * weights)
+        q2_loss = torch.mean((curr_q2 - target_q).pow(2) * weights)
+        
+        return q1_loss, q2_loss, errors, mean_q1, mean_q2
+        
+    def calc_critic_q_loss(self, batch, weights):
+        curr_q1, curr_q2 = self.calc_current_q(*batch)
+        target_q = self.calc_target_q(*batch)
+        q1_loss = torch.mean((curr_q1 - target_q).pow(2) * weights)
+        q2_loss = torch.mean((curr_q2 - target_q).pow(2) * weights)
+        return q1_loss, q2_loss
+    
+    def calc_critic_v_loss(self, batch, weights):
+        states, actions, rewards, next_states, dones = batch
+        with torch.no_grad():
+            outs = self.policy(states)
+            outputs_ego_trajs, index, action_probs, entropy, log_pis = self.process_action(outs)
+            
+            actions_new = outputs_ego_trajs[index]
+            q1_new = self.qf1(states, actions_new)
+            q2_new = self.qf2(states, actions_new)
+            min_q = torch.min(q1_new, q2_new)
+            target_v = min_q - self.alpha * log_pis
+        v = self.vf(states)
+        v_loss = torch.mean((v - target_v).pow(2) * weights)
+        td_error = (v - target_v).detach().item()
+        return v_loss, td_error
+    
+    def calc_policy_loss(self, batch, weights):
+        states, actions, rewards, next_states, dones = batch
+        outs = self.policy(states)
+        outputs_ego_trajs, index, action_probs, entropy, log_pis = self.process_action(outs)
+        
+        actions_new = outputs_ego_trajs[index]
+        q1_new = self.qf1(states, actions_new)
+        q2_new = self.qf2(states, actions_new)
+        min_q = torch.min(q1_new, q2_new)
+        actor_loss = (weights *(self.alpha * log_pis - min_q)).mean()
+
+        return actor_loss, log_pis
+    
+    def calc_entropy_loss(self, log_pis, weights):
+        assert not log_pis.requires_grad
+        if self.auto_alpha:
+            alpha_loss = -tf.reduce_mean((self.alpha * tf.stop_gradient(log_pis + self.target_alpha))* weights)
+        return alpha_loss
+         
+    def process_action(self, outs, test=False):
+        outputs_ego_cls_expert = outs['ego_cls_expert_preds']
+        outputs_ego_trajs = outs['ego_fut_preds']
+        
+        action_probs = F.softmax(outputs_ego_cls_expert, dim=1)
+        action_dist = Categorical(action_probs)
+        
+        if test:
+            raw_actions = torch.argmax(outputs_ego_cls_expert, dim=1, keepdim=True)
+        else:
+            raw_actions = action_dist.sample()
+        entropy = action_dist.entropy()
+        log_pis = action_dist.log_prob(raw_actions)
+        
+        if self._squash:
+            actions = tf.tanh(raw_actions)
+            diff = tf.reduce_sum(tf.math.log(1 - actions ** 2 + self.EPS), axis=1)
+            log_pis -= diff
+        else:
+            actions = raw_actions
+        return outputs_ego_trajs, raw_actions, action_probs, entropy, log_pis
+    
+    def learn(self):
+        assert hasattr(self, 'qf1_optimizer,') and hasattr(self, 'qf2_optimizer') and\
+            hasattr(self, 'policy_optimizer') and hasattr(self, 'alpha_optimizer') and\
+            hasattr(self, 'vf_optimizer')
+
+        self.learning_steps += 1
+
+        if self.use_per:
+            batch, weights = self.memory.sample(self.batch_size)
+        else:
+            batch = self.memory.sample(self.batch_size)
+            # Set priority weights to 1 when we don't use PER.
+            weights = 1.
+            
+        q1_loss, q2_loss = self.calc_critic_q_loss(batch, weights)
+        v_loss,td_error = self.calc_critic_v_loss(batch, weights)
+        actor_loss, log_pis = self.calc_policy_loss(batch, weights)
+        alpha_loss = self.calc_entropy_loss(log_pis, weights)
+        
+        update_params(self.qf1_optimizer, q1_loss)
+        update_params(self.qf2_optimizer, q2_loss)
+        update_params(self.vf_optimizer, v_loss)
+        update_params(self.policy_optimizer, actor_loss)
+        update_params(self.alpha_optimizer, alpha_loss)
+
+        if self.use_per:
+            self.memory.update_priority(td_error)
+
+        if self.learning_steps % self.log_interval == 0:
+
+            self.writer.add_scalar(
+                'loss/Q1', q1_loss.detach().item(),
+                self.learning_steps)
+            self.writer.add_scalar(
+                'loss/Q2', q2_loss.detach().item(),
+                self.learning_steps)
+            self.writer.add_scalar(
+                'loss/V', v_loss.detach().item(),
+                self.learning_steps)
+            self.writer.add_scalar(
+                'loss/policy', actor_loss.detach().item(),
+                self.learning_steps)
+            self.writer.add_scalar(
+                'loss/alpha', alpha_loss.detach().item(),
+                self.learning_steps)
+            self.writer.add_scalar(
+                'stats/alpha', self.alpha.detach().item(),
+                self.learning_steps)
+            self.writer.add_scalar(
+                'stats/entropy', log_pis.detach().mean().item(),
+                self.learning_steps)
+            
+    def save_models(self, save_dir):
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            
+        current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        
+        torch.save(self.policy.state_dict(), os.path.join(save_dir, current_time + 'policy.pth'))
+        torch.save(self.qf1.state_dict(), os.path.join(save_dir, current_time + 'qf1.pth'))
+        torch.save(self.qf2.state_dict(), os.path.join(save_dir, current_time + 'qf2.pth'))
+        torch.save(self.vf.state_dict(), os.path.join(save_dir, current_time + 'vf.pth'))
+        
+    def update_target(self):
+        with torch.no_grad():
+            for target_param, param in zip(self.vf_target.parameters(), self.vf.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
+                
     def _init(self):
         try:
             locx, locy = self._global_plan_world_coord[0][0].location.x, self._global_plan_world_coord[0][0].location.y
@@ -190,7 +485,6 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         self._route_planner.set_route(self._global_plan, True)
         self.initialized = True
         self.metric_info = {}
-  
   
 
     def sensors(self):
@@ -259,6 +553,22 @@ class VadAgent(autonomous_agent.AutonomousAgent):
                     'type': 'sensor.speedometer',
                     'reading_frequency': 20,
                     'id': 'SPEED'
+                },
+                # collision sensor
+                {
+                    'type': 'sensor.other.collision',
+                    'x': 0.0, 'y': 0.0, 'z': 0.0,
+                    'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+                    'sensor_tick': 0.1,
+                    'id': 'COLLISION_SENSOR'
+                },
+                # lane invasion sensors
+                {
+                    'type': 'sensor.other.lane_invasion',
+                    'x': 0.0, 'y': 0.0, 'z': 0.0,
+                    'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+                    'sensor_tick': 0.1,
+                    'id': 'LANE_INVASION_SENSOR'
                 },
             ]
         if IS_BENCH2DRIVE:
@@ -389,7 +699,7 @@ class VadAgent(autonomous_agent.AutonomousAgent):
             if key != 'img_metas':
                 if torch.is_tensor(data[0]):
                     data[0] = data[0].to(self.device)
-        output_data_batch = self.model(input_data_batch, return_loss=False, rescale=True)
+        output_data_batch, prev_frame_info = self.model(input_data_batch, return_loss=False, rescale=True)
         all_out_truck_d1 = output_data_batch[0]['pts_bbox']['ego_fut_preds'].cpu().numpy()
         all_out_truck =  np.cumsum(all_out_truck_d1,axis=1)
         out_truck = all_out_truck[command]
@@ -422,9 +732,10 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         if len(self.prev_control_cache)==10:
             self.prev_control_cache.pop(0)
         self.prev_control_cache.append(control)
-        return control
+        return control, {"prev_frame_info":prev_frame_info, "input":input_data_batch, "output":output_data_batch}
 
-
+    def learn(self):
+        a=1
     def save(self, tick_data):
         frame = self.step // 10
 
