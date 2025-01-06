@@ -35,7 +35,9 @@ QUALIFIER_SENSORS_LIMITS = {
     'sensor.other.gnss': 1,
     'sensor.other.imu': 1,
     'sensor.opendrive_map': 1,
-    'sensor.speedometer': 1
+    'sensor.speedometer': 1,
+    'sensor.other.collision': 1,
+    'sensor.other.lane_invasion':1
 }
 SENSORS_LIMITS = {
     'sensor.camera.rgb': 8,
@@ -44,7 +46,9 @@ SENSORS_LIMITS = {
     'sensor.other.gnss': 1,
     'sensor.other.imu': 1,
     'sensor.opendrive_map': 1,
-    'sensor.speedometer': 1
+    'sensor.speedometer': 1,
+    'sensor.other.collision': 1,
+    'sensor.other.lane_invasion':1
 }
 ALLOWED_SENSORS = SENSORS_LIMITS.keys()
 
@@ -216,7 +220,23 @@ class AgentWrapper(object):
                                              y=sensor_spec['y'],
                                              z=sensor_spec['z'])
             sensor_rotation = carla.Rotation()
-
+            
+        elif type_ == 'sensor.other.collision':
+            sensor_location = carla.Location(x=sensor_spec['x'], 
+                                             y=sensor_spec['y'], 
+                                             z=sensor_spec['z'])
+            sensor_rotation = carla.Rotation(pitch=sensor_spec['pitch'], 
+                                             roll=sensor_spec['roll'], 
+                                             yaw=sensor_spec['yaw'])
+            
+        elif type_ == 'sensor.other.lane_invasion':
+            sensor_location = carla.Location(x=sensor_spec['x'], 
+                                             y=sensor_spec['y'], 
+                                             z=sensor_spec['z'])
+            sensor_rotation = carla.Rotation(pitch=sensor_spec['pitch'], 
+                                             roll=sensor_spec['roll'], 
+                                             yaw=sensor_spec['yaw'])
+            
         elif type_ == 'sensor.other.imu':
             attributes['noise_accel_stddev_x'] = str(0.001)
             attributes['noise_accel_stddev_y'] = str(0.001)
@@ -251,7 +271,12 @@ class AgentWrapper(object):
                 sensor = OpenDriveMapReader(vehicle, attributes['reading_frequency'])
             elif type_ == 'sensor.speedometer':
                 sensor = SpeedometerReader(vehicle, attributes['reading_frequency'])
-
+            elif type_ == 'sensor.other.collision':
+                bp = bp_library.find(type_)
+                sensor = CarlaDataProvider.get_world().spawn_actor(bp, sensor_transform, vehicle)
+            elif type_ == 'sensor.other.lane_invasion':
+                bp = bp_library.find(type_)
+                sensor = CarlaDataProvider.get_world().spawn_actor(bp, sensor_transform, vehicle)
             # These are the sensors spawned on the carla world
             else:
                 bp = bp_library.find(type_)

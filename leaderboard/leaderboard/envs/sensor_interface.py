@@ -148,6 +148,10 @@ class CallBack(object):
             self._parse_gnss_cb(data, self._tag)
         elif isinstance(data, carla.libcarla.IMUMeasurement):
             self._parse_imu_cb(data, self._tag)
+        elif isinstance(data, carla.libcarla.CollisionEvent):
+            self._parse_collison_cb(data, self._tag)
+        elif isinstance(data, carla.libcarla.LaneInvasionEvent):
+            self._parse_lane_invasion_cb(data, self._tag)
         elif isinstance(data, GenericMeasurement):
             self._parse_pseudosensor(data, self._tag)
         else:
@@ -190,6 +194,17 @@ class CallBack(object):
                           imu_data.compass,
                          ], dtype=np.float64)
         self._data_provider.update_sensor(tag, array, imu_data.frame)
+        
+    def _parse_collison_cb(self, collison_data, tag):
+        self._data_provider.collision_hist.append(collison_data)
+        
+    def _parse_lane_invasion_cb(self, lane_invasion_data, tag):
+        lane_types = set(x.type for x in lane_invasion_data.crossed_lane_markings)
+        for x in lane_types:
+            lane_type = str(x).split()[-1]
+            if lane_type in ["Solid","SolidSolid","SolidBroken","BrokenSolid","Grass","Curb"]:
+                self._data_provider.lane_invasion_hist.append(lane_type)
+                break
 
     def _parse_pseudosensor(self, package, tag):
         self._data_provider.update_sensor(tag, package.data, package.frame)
@@ -200,7 +215,9 @@ class SensorInterface(object):
         self._sensors_objects = {}
         self._data_buffers = Queue()
         self._queue_timeout = 300
-
+        self.collision_hist = []
+        self.lane_invasion_hist = []
+        
         # Only sensor that doesn't get the data on tick, needs special treatment
         self._opendrive_tag = None
 
@@ -223,7 +240,7 @@ class SensorInterface(object):
         """Read the queue to get the sensors data"""
         try:
             data_dict = {}
-            while len(data_dict.keys()) < len(self._sensors_objects.keys()):
+            while len(data_dict.keys()) < len(self._sensors_objects.keys())-2:
                 # Don't wait for the opendrive sensor
                 if self._opendrive_tag and self._opendrive_tag not in data_dict.keys() \
                         and len(self._sensors_objects.keys()) == len(data_dict.keys()) + 1:
@@ -236,5 +253,15 @@ class SensorInterface(object):
 
         except Empty:
             raise SensorReceivedNoData("A sensor took too long to send their data")
-
+        
+        if len(self.collision_hist) == 0:
+            data_dict['COLLISION_SENSOR'] = 0
+        else:
+            data_dict['COLLISION_SENSOR'] = 1
+            
+        if len(self.lane_invasion_hist) == 0:
+            data_dict['LANE_INVASION_SENSOR'] = 0
+        else:
+            data_dict['LANE_INVASION_SENSOR'] = 1
+            
         return data_dict

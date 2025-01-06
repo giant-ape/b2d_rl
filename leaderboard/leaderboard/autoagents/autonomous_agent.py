@@ -104,7 +104,8 @@ class AutonomousAgent(object):
         Returns the next vehicle controls
         """
         input_data = self.sensor_interface.get_data(GameTime.get_frame())
-
+        collision = input_data.pop('COLLISION_SENSOR')
+        lane_invasion = input_data.pop('LANE_INVASION_SENSOR')
         timestamp = GameTime.get_time()
 
         if not self.wallclock_t0:
@@ -116,11 +117,13 @@ class AutonomousAgent(object):
         print('=== [Agent] -- Wallclock = {} -- System time = {} -- Game time = {} -- Ratio = {}x'.format(
             str(wallclock)[:-3], format(wallclock_diff, '.3f'), format(timestamp, '.3f'), format(sim_ratio, '.3f')), flush=True)
 
-        control = self.run_step(input_data, timestamp)
+        control, buffer_data = self.run_step(input_data, timestamp)
         control.manual_gear_shift = False
 
-        return control
+        return control, buffer_data 
 
+    def learn(self):
+        pass
     @staticmethod
     def get_ros_version():
         return -1

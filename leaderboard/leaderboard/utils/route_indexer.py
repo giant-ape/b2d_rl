@@ -28,6 +28,11 @@ class RouteIndexer():
     def peek(self):
         return self.index < self.total
 
+    def get_random_config(self):
+        index = np.random.randint(0, self.total)
+        config = self._configs_list[index]
+        return config
+    
     def get_next_config(self):
         if self.index >= self.total:
             return None
