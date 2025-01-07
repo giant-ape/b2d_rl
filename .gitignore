@@ -3,3 +3,4 @@ __pycache__/
 eval_v1
 eval.json
 .vscode
+Bench2DriveZoo/ckpt/vad_b2d_base.pth

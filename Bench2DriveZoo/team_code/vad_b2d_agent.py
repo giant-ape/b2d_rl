@@ -27,6 +27,7 @@ from mmcv.core.bbox import get_box_type
 from pyquaternion import Quaternion
 from Bench2DriveZoo.team_code.replay_buffer import LazyPrioritizedMultiStepMemory
 from torch.utils.tensorboard import SummaryWriter
+from torch.distributions import Categorical
 
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
@@ -199,7 +200,8 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         self.auto_alpha = cfg.auto_alpha
         self.target_update_interval = cfg.target_update_interval
         self.learning_steps = 0
-        self.log_interval = 0
+        self.log_interval = 1
+        self._squash = cfg.squash
         
         if cfg.auto_alpha:
             self.log_alpha = torch.tensor(np.log(cfg.alpha), requires_grad=True, device=self.device)
@@ -207,19 +209,17 @@ class VadAgent(autonomous_agent.AutonomousAgent):
             self.target_alpha = -np.log(1.0 / cfg.action_size) * cfg.target_entropy_ratio
             self.alpha_optimizer = AdamW([self.log_alpha], lr=lr)
 
-        if use_per:
+        if cfg.use_per:
             beta_steps = (cfg.num_steps - cfg.start_steps) / cfg.update_interval
             self.memory = LazyPrioritizedMultiStepMemory(
                 capacity=cfg.memory_size,
-                state_shape = cfg.state_shape,
                 device=self.device, 
                 gamma=cfg.gamma, 
                 multi_step=cfg.multi_step,
-                beta_steps=cfg.beta_steps)
+                beta_steps=beta_steps)
         else:
             self.memory = LazyMultiStepMemory(
                 capacity=cfg.memory_size,
-                state_shape = cfg.state_shape,
                 device=self.device, 
                 gamma=cfg.gamma, 
                 multi_step=cfg.multi_step)
@@ -237,11 +237,11 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         self.writer = SummaryWriter(log_dir=self.summary_dir)
         
     def init_rl_model(self):
-        self.qf1 = build_model(cfg.model2,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
-        self.qf2 = build_model(cfg.model2,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
-        self.vf = build_model(cfg.model2,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
-        self.vf_target = build_model(cfg.model2,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
-        self.policy = build_model(cfg.model3,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
+        self.qf1 = build_model(cfg.qf_model,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
+        self.qf2 = build_model(cfg.qf_model,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
+        self.vf = build_model(cfg.vf_model,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
+        self.vf_target = build_model(cfg.vf_model,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
+        self.policy = build_model(cfg.policy_model,train_cfg=cfg.get('train_cfg'),test_cfg=cfg.get('test_cfg'))
         
         self.qf1.init_weights()
         self.qf2.init_weights()
@@ -343,7 +343,7 @@ class VadAgent(autonomous_agent.AutonomousAgent):
     def calc_critic_v_loss(self, batch, weights):
         states, actions, rewards, next_states, dones = batch
         with torch.no_grad():
-            outs = self.policy(states)
+            outs = self.policy.exploit(states)
             outputs_ego_trajs, index, action_probs, entropy, log_pis = self.process_action(outs)
             
             actions_new = outputs_ego_trajs[index]
@@ -358,8 +358,9 @@ class VadAgent(autonomous_agent.AutonomousAgent):
     
     def calc_policy_loss(self, batch, weights):
         states, actions, rewards, next_states, dones = batch
-        outs = self.policy(states)
-        outputs_ego_trajs, index, action_probs, entropy, log_pis = self.process_action(outs)
+        output_data_batch, prev_frame_info = self.policy.exploit(states)
+        
+        outputs_ego_trajs, index, action_probs, entropy, log_pis = self.process_action(output_data_batch)
         
         actions_new = outputs_ego_trajs[index]
         q1_new = self.qf1(states, actions_new)
@@ -376,8 +377,8 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         return alpha_loss
          
     def process_action(self, outs, test=False):
-        outputs_ego_cls_expert = outs['ego_cls_expert_preds']
-        outputs_ego_trajs = outs['ego_fut_preds']
+        outputs_ego_cls_expert = outs[0]['pts_bbox']['ego_cls_expert_preds']
+        outputs_ego_trajs = outs[0]['pts_bbox']['ego_fut_preds']
         
         action_probs = F.softmax(outputs_ego_cls_expert, dim=1)
         action_dist = Categorical(action_probs)
@@ -395,7 +396,7 @@ class VadAgent(autonomous_agent.AutonomousAgent):
             log_pis -= diff
         else:
             actions = raw_actions
-        return outputs_ego_trajs, raw_actions, action_probs, entropy, log_pis
+        return outputs_ego_trajs, actions, action_probs, entropy, log_pis
     
     def learn(self):
         assert hasattr(self, 'qf1_optimizer,') and hasattr(self, 'qf2_optimizer') and\
@@ -734,8 +735,126 @@ class VadAgent(autonomous_agent.AutonomousAgent):
         self.prev_control_cache.append(control)
         return control, {"prev_frame_info":prev_frame_info, "input":input_data_batch, "output":output_data_batch}
 
-    def learn(self):
-        a=1
+    @torch.no_grad()
+    def rl_run_step(self, input_data, timestamp):
+        if not self.initialized:
+            self._init()
+        tick_data = self.tick(input_data)
+        results = {}
+        results['lidar2img'] = []
+        results['lidar2cam'] = []
+        results['img'] = []
+        results['folder'] = ' '
+        results['scene_token'] = ' '  
+        results['frame_idx'] = 0
+        results['timestamp'] = self.step / 20
+        results['box_type_3d'], _ = get_box_type('LiDAR')
+  
+        for cam in ['CAM_FRONT','CAM_FRONT_LEFT','CAM_FRONT_RIGHT','CAM_BACK','CAM_BACK_LEFT','CAM_BACK_RIGHT']:
+            results['lidar2img'].append(self.lidar2img[cam])
+            results['lidar2cam'].append(self.lidar2cam[cam])
+            results['img'].append(tick_data['imgs'][cam])
+        results['lidar2img'] = np.stack(results['lidar2img'],axis=0)
+        results['lidar2cam'] = np.stack(results['lidar2cam'],axis=0)
+        raw_theta = tick_data['compass']   if not np.isnan(tick_data['compass']) else 0
+        ego_theta = -raw_theta + np.pi/2
+        rotation = list(Quaternion(axis=[0, 0, 1], radians=ego_theta))
+        can_bus = np.zeros(18)
+        can_bus[0] = tick_data['pos'][0]
+        can_bus[1] = -tick_data['pos'][1]
+        can_bus[3:7] = rotation
+        can_bus[7] = tick_data['speed']
+        can_bus[10:13] = tick_data['acceleration']
+        can_bus[11] *= -1
+        can_bus[13:16] = -tick_data['angular_velocity']
+        can_bus[16] = ego_theta
+        can_bus[17] = ego_theta / np.pi * 180 
+        results['can_bus'] = can_bus
+        ego_lcf_feat = np.zeros(9)
+        ego_lcf_feat[0:2] = can_bus[0:2].copy()
+        ego_lcf_feat[2:4] = can_bus[10:12].copy()
+        ego_lcf_feat[4] = rotation[-1]
+        ego_lcf_feat[5] = 4.89238167
+        ego_lcf_feat[6] = 1.83671331
+        ego_lcf_feat[7] = np.sqrt(can_bus[0]**2+can_bus[1]**2)
+
+        if len(self.prev_control_cache)<10:
+            ego_lcf_feat[8] = 0
+        else:
+            ego_lcf_feat[8] = self.prev_control_cache[0].steer
+
+        command = tick_data['command_near']
+        if command < 0:
+            command = 4
+        command -= 1
+        results['command'] = command
+        command_onehot = np.zeros(6)
+        command_onehot[command] = 1
+        results['ego_fut_cmd'] = command_onehot
+        theta_to_lidar = raw_theta
+        command_near_xy = np.array([tick_data['command_near_xy'][0]-can_bus[0],-tick_data['command_near_xy'][1]-can_bus[1]])
+        rotation_matrix = np.array([[np.cos(theta_to_lidar),-np.sin(theta_to_lidar)],[np.sin(theta_to_lidar),np.cos(theta_to_lidar)]])
+        local_command_xy = rotation_matrix @ command_near_xy
+  
+        ego2world = np.eye(4)
+        ego2world[0:3,0:3] = Quaternion(axis=[0, 0, 1], radians=ego_theta).rotation_matrix
+        ego2world[0:2,3] = can_bus[0:2]
+        lidar2global = ego2world @ self.lidar2ego
+        results['l2g_r_mat'] = lidar2global[0:3,0:3]
+        results['l2g_t'] = lidar2global[0:3,3]
+        stacked_imgs = np.stack(results['img'],axis=-1)
+        results['img_shape'] = stacked_imgs.shape
+        results['ori_shape'] = stacked_imgs.shape
+        results['pad_shape'] = stacked_imgs.shape
+        results = self.inference_only_pipeline(results)
+        self.device="cuda"
+        input_data_batch = mm_collate_to_batch_form([results], samples_per_gpu=1)
+        for key, data in input_data_batch.items():
+            if key != 'img_metas':
+                if torch.is_tensor(data[0]):
+                    data[0] = data[0].to(self.device)
+                    
+        output_data_batch, prev_frame_info = self.policy.explore(input_data_batch, rescale=True)
+        
+        outputs_ego_cls_expert = output_data_batch[0]['pts_bbox']['ego_cls_expert_preds'].cpu().numpy()
+        outputs_ego_trajs = output_data_batch[0]['pts_bbox']['ego_fut_preds'].cpu().numpy()
+        action_probs = F.softmax(outputs_ego_cls_expert, dim=1)
+        action_dist = Categorical(action_probs)
+        raw_actions = action_dist.sample()
+        out_truck = outputs_ego_trajs[raw_actions]
+        out_truck =  np.cumsum(out_truck,axis=1)
+
+        steer_traj, throttle_traj, brake_traj, metadata_traj = self.pidcontroller.control_pid(out_truck, tick_data['speed'], local_command_xy)
+        if brake_traj < 0.05: brake_traj = 0.0
+        if throttle_traj > brake_traj: brake_traj = 0.0
+
+        control = carla.VehicleControl()
+        self.pid_metadata = metadata_traj
+        self.pid_metadata['agent'] = 'only_traj'
+        control.steer = np.clip(float(steer_traj), -1, 1)
+        control.throttle = np.clip(float(throttle_traj), 0, 0.75)
+        control.brake = np.clip(float(brake_traj), 0, 1)     
+        self.pid_metadata['steer'] = control.steer
+        self.pid_metadata['throttle'] = control.throttle
+        self.pid_metadata['brake'] = control.brake
+        self.pid_metadata['steer_traj'] = float(steer_traj)
+        self.pid_metadata['throttle_traj'] = float(throttle_traj)
+        self.pid_metadata['brake_traj'] = float(brake_traj)
+        self.pid_metadata['plan'] = out_truck.tolist()
+        self.pid_metadata['command'] = command
+        self.pid_metadata['all_plan'] = all_out_truck.tolist()
+
+        metric_info = self.get_metric_info()
+        self.metric_info[self.step] = metric_info
+        if SAVE_PATH is not None and self.step % 1 == 0:
+            self.save(tick_data)
+        self.prev_control = control
+        
+        if len(self.prev_control_cache)==10:
+            self.prev_control_cache.pop(0)
+        self.prev_control_cache.append(control)
+        return control, {"prev_frame_info":prev_frame_info, "input":input_data_batch, "output":output_data_batch}
+    
     def save(self, tick_data):
         frame = self.step // 10
 

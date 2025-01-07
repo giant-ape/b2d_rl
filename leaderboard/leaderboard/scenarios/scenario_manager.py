@@ -175,7 +175,7 @@ class ScenarioManager(object):
             #         next_state = state
             #     else:
             #         next_state = self.prev_frame_infos[0]["state"]
-            #     self.memory.append(state, action, reward, next_state, done)
+            #     self._agent_wrapper._agent.memory.append(state, action, reward, next_state, done)
                 
         # self.n_episode += 1
         
