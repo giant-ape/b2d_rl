@@ -995,6 +995,7 @@ class VADCustomNuScenesDataset(NuScenesDataset):
         padding_value=-10000,
         use_pkl_result=False,
         custom_eval_version='vad_nusc_detection_cvpr_2019',
+        samples_per_gpu=1,
         *args,
         **kwargs
     ):

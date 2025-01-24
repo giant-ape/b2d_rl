@@ -13,7 +13,7 @@ from .voxelize import Voxelization, voxelization
 from .nms import batched_nms, nms, nms_match, nms_rotated, soft_nms
 from .masked_conv import MaskedConv2d, masked_conv2d
 from .deform_conv import DeformConv2d, DeformConv2dPack, deform_conv2d
-
+from .geometry_kernel_attention import GeometrySptialCrossAttention, GeometryKernelAttention
 
 # __all__ = [
 #     'bbox_overlaps', 'CARAFE', 'CARAFENaive', 'CARAFEPack', 'carafe',

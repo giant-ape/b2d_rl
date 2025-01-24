@@ -4,3 +4,10 @@ eval_v1
 eval.json
 .vscode
 Bench2DriveZoo/ckpt/vad_b2d_base.pth
+Bench2DriveZoo/outputs
+gcc-5.5.0
+jpeg-8d1
+Bench2DriveZoo/work_dirs
+Bench2DriveZoo/data
+r101_dcn_fcos3d_pretrain.pth
+vad_b2d_base.pth

@@ -25,7 +25,7 @@ from mmcv.utils import set_random_seed
 
 from mmcv.utils import TORCH_VERSION, digit_version
 from adzoo.bevformer.mmdet3d_plugin.bevformer.apis.train import custom_train_model
-
+from mmcv.utils import get_dist_info, init_dist, wrap_fp16_model, set_random_seed, Config, DictAction, load_checkpoint
 import cv2
 cv2.setNumThreads(1)
 
@@ -192,6 +192,15 @@ def main():
     cfg.seed = args.seed
     meta['seed'] = args.seed
     meta['exp_name'] = osp.basename(args.config)
+
+    model_w = build_model(
+        cfg.model_w,
+        train_cfg=cfg.get('train_cfg'),
+        test_cfg=cfg.get('test_cfg'))
+    strict = False  # 忽略非匹配参数
+
+    model_w.load_state_dict(load_checkpoint(model_w, "/data6/zengjunyuan/VAD/outputs/1217/epoch_40.pth", map_location='cpu'), strict=False)
+    state_dict_w = model_w.state_dict()
 
     model = build_model(
         cfg.model,
